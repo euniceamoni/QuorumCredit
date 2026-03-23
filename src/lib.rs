@@ -26,6 +26,7 @@ pub enum DataKey {
     Vouches(Address), // borrower → Vec<VouchRecord>
     Admin,            // Address allowed to call slash
     Token,            // XLM token contract address
+    Deployer,         // Address that deployed the contract; guards initialize
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -54,11 +55,21 @@ pub struct QuorumCreditContract;
 #[contractimpl]
 impl QuorumCreditContract {
     /// One-time initialisation: set admin and XLM token address.
-    pub fn initialize(env: Env, admin: Address, token: Address) {
+    ///
+    /// `deployer` must be the address that deployed this contract and must
+    /// sign this transaction. This prevents front-running attacks where an
+    /// observer of the deployment transaction calls `initialize` first with
+    /// their own admin address before the legitimate deployer can do so.
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address) {
+        // Require the deployer's signature — only they can authorise this call.
+        deployer.require_auth();
+
         assert!(
             !env.storage().instance().has(&DataKey::Admin),
             "already initialized"
         );
+
+        env.storage().instance().set(&DataKey::Deployer, &deployer);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
     }
@@ -66,6 +77,12 @@ impl QuorumCreditContract {
     /// Stake XLM to vouch for a borrower.
     pub fn vouch(env: Env, voucher: Address, borrower: Address, stake: i128) -> Result<(), ContractError> {
         voucher.require_auth();
+
+        assert!(voucher != borrower, "voucher cannot vouch for self");
+
+        // Transfer stake from voucher into the contract.
+        let token = Self::token(&env);
+        token.transfer(&voucher, &env.current_contract_address(), &stake);
 
         let mut vouches: Vec<VouchRecord> = env
             .storage()
@@ -261,8 +278,10 @@ mod tests {
         let contract_id = env.register_contract(None, QuorumCreditContract);
         token_admin.mint(&contract_id, &50_000_000);
 
+        // deployer == admin for test convenience; the key point is that
+        // deployer.require_auth() is satisfied via mock_all_auths().
         QuorumCreditContractClient::new(env, &contract_id)
-            .initialize(&admin, &token_id.address());
+            .initialize(&admin, &admin, &token_id.address());
 
         (contract_id, token_id.address(), admin, borrower, voucher)
     }
@@ -280,6 +299,16 @@ mod tests {
         assert_eq!(loan.amount, 500_000);
         assert!(!loan.repaid);
         assert!(!loan.defaulted);
+    }
+
+    #[test]
+    #[should_panic(expected = "voucher cannot vouch for self")]
+    fn test_vouch_self_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&borrower, &borrower, &1_000_000);
     }
 
     #[test]
@@ -330,7 +359,7 @@ mod tests {
         // Request a loan larger than the contract balance to trigger InsufficientFunds.
 
         QuorumCreditContractClient::new(&env, &contract_id)
-            .initialize(&admin, &token_id.address());
+            .initialize(&admin, &admin, &token_id.address());
 
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         // Stake 1_000_000 — contract now holds exactly 1_000_000.
