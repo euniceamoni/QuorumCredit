@@ -689,6 +689,26 @@ impl QuorumCreditContract {
 
     /// Admin sets the loan duration (in seconds) applied to future loans.
     pub fn set_loan_duration(env: Env, duration_seconds: u64) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        assert!(amount >= 0, "min stake cannot be negative");
+        env.storage().instance().set(&DataKey::MinStake, &amount);
+    }
+
+    /// Returns the current minimum vouch stake (0 means no minimum).
+    pub fn get_min_stake(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinStake)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the loan duration (in seconds) applied to future loans.
+    pub fn set_loan_duration(env: Env, duration_seconds: u64) {
     /// Admin updates configurable protocol parameters.
     pub fn set_config(env: Env, config: Config) {
         let admin: Address = env
@@ -1219,11 +1239,6 @@ mod tests {
 
         QuorumCreditContractClient::new(&env, &contract_id)
             .initialize(&admin, &admin, &token_id.address(), &150);
-        QuorumCreditContractClient::new(&env, &contract_id).initialize(
-            &admin,
-            &admin,
-            &token_id.address(),
-        );
 
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         // Stake 1_000_000 — contract now holds exactly 1_000_000.
