@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -265,6 +267,11 @@ impl QuorumCreditContract {
 
         // Disburse the loan to the borrower.
         token.transfer(&env.current_contract_address(), &borrower, &amount);
+
+        env.events().publish(
+            (symbol_short!("loan"), symbol_short!("disbursed")),
+            (borrower.clone(), amount, deadline),
+        );
 
         Ok(())
     }
@@ -622,7 +629,11 @@ impl QuorumCreditContract {
     }
 
     pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
-        match env.storage().persistent().get::<DataKey, LoanRecord>(&DataKey::Loan(borrower)) {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, LoanRecord>(&DataKey::Loan(borrower))
+        {
             None => LoanStatus::None,
             Some(loan) if loan.repaid => LoanStatus::Repaid,
             Some(loan) if loan.defaulted => LoanStatus::Defaulted,
@@ -690,7 +701,7 @@ impl QuorumCreditContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Events as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
         Address, Env,
     };
@@ -718,8 +729,6 @@ mod tests {
             &token_id.address(),
             &150,
         );
-        QuorumCreditContractClient::new(env, &contract_id)
-            .initialize(&admin, &admin, &token_id.address(), &150);
 
         (contract_id, token_id.address(), admin, borrower, voucher)
     }
@@ -740,6 +749,51 @@ mod tests {
         assert!(!loan.defaulted);
         assert!(loan.created_at > 0);
         assert!(loan.deadline > loan.created_at);
+    }
+
+    #[test]
+    fn test_request_loan_emits_event() {
+        use soroban_sdk::{IntoVal, Val};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_admin = StellarAssetClient::new(&env, &token_id.address());
+        token_admin.mint(&voucher, &10_000_000);
+
+        let contract_id = env.register_contract(None, QuorumCreditContract);
+        token_admin.mint(&contract_id, &50_000_000);
+
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &admin, &token_id.address(), &150);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+
+        let topic_loan: Val = symbol_short!("loan").into_val(&env);
+        let topic_disbursed: Val = symbol_short!("disbursed").into_val(&env);
+
+        let (_, _, data) = env
+            .events()
+            .all()
+            .iter()
+            .find(|(_, topics, _)| {
+                topics.len() == 2
+                    && topics.get_unchecked(0).get_payload() == topic_loan.get_payload()
+                    && topics.get_unchecked(1).get_payload() == topic_disbursed.get_payload()
+            })
+            .expect("loan_disbursed event not emitted");
+
+        let (event_borrower, event_amount, _event_deadline): (Address, i128, u64) =
+            data.into_val(&env);
+        assert_eq!(event_borrower, borrower);
+        assert_eq!(event_amount, 500_000);
     }
 
     #[test]
@@ -816,8 +870,6 @@ mod tests {
             &token_id.address(),
             &150,
         );
-        QuorumCreditContractClient::new(&env, &contract_id)
-            .initialize(&admin, &admin, &token_id.address(), &150);
 
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         // Stake 1_000_000 — contract now holds exactly 1_000_000.
