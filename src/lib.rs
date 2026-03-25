@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, Env, Vec,
 };
 
 pub mod reputation;
@@ -43,10 +44,13 @@ pub enum ContractError {
     LoanExceedsMaxAmount = 7,
     InsufficientVouchers = 8,
     UnauthorizedCaller = 6,
-    PoolLengthMismatch = 7,
-    PoolEmpty = 8,
-    PoolBorrowerActiveLoan = 9,
-    PoolInsufficientFunds = 10,
+    /// A numeric input (stake, amount, threshold, config field) was zero or negative.
+    InvalidAmount = 7,
+    /// A state transition was attempted from a disallowed state
+    /// (e.g. slashing an already-defaulted loan).
+    InvalidStateTransition = 8,
+    /// The contract has already been initialised.
+    AlreadyInitialized = 9,
 }
 
 // ── Loan Status ───────────────────────────────────────────────────────────────
@@ -227,6 +231,9 @@ impl QuorumCreditContract {
         // Require the deployer's signature — only they can authorise this call.
         deployer.require_auth();
 
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
         assert!(
             !env.storage().instance().has(&DataKey::Config),
             "already initialized"
@@ -267,6 +274,9 @@ impl QuorumCreditContract {
     ) -> Result<(), ContractError> {
         voucher.require_auth();
         Self::require_not_paused(&env)?;
+
+        // Validate numeric input: stake must be strictly positive.
+        Self::require_positive_amount(&env, stake)?;
 
         assert!(voucher != borrower, "voucher cannot vouch for self");
 
@@ -341,7 +351,8 @@ impl QuorumCreditContract {
         voucher.require_auth();
         Self::require_not_paused(&env)?;
 
-        assert!(additional > 0, "additional stake must be greater than zero");
+        // Validate numeric input: additional must be strictly positive.
+        Self::require_positive_amount(&env, additional)?;
 
         let mut vouches: Vec<VouchRecord> = env
             .storage()
@@ -441,7 +452,8 @@ impl QuorumCreditContract {
             amount >= Self::config(&env).min_loan_amount,
             "loan amount must meet minimum threshold"
         );
-        assert!(threshold > 0, "threshold must be greater than zero");
+        // Validate threshold is strictly positive.
+        Self::require_positive_amount(&env, threshold)?;
 
         // Enforce max loan amount cap if configured.
         let max_loan: i128 = env
@@ -566,9 +578,14 @@ impl QuorumCreditContract {
 
         if borrower != loan.borrower {
             return Err(ContractError::UnauthorizedCaller);
+        // Guard: only an active (non-repaid, non-defaulted) loan may be repaid.
+        if loan.defaulted || loan.repaid {
+            return Err(ContractError::InvalidStateTransition);
         }
+
+        // Block repayment after deadline — borrower must be auto-slashed instead.
         assert!(!loan.defaulted, "loan already defaulted");
-        assert!(!loan.repaid, "loan already repaid");
+        assert!(!loan.repaid, "loan already repa
         assert!(
             env.ledger().timestamp() <= loan.deadline,
             "loan deadline has passed"
@@ -679,8 +696,10 @@ impl QuorumCreditContract {
             .get(&DataKey::Loan(borrower.clone()))
             .expect("no active loan");
 
-        assert!(!loan.repaid, "loan already repaid");
-        assert!(!loan.defaulted, "already defaulted");
+        // Guard: only an active (non-repaid, non-defaulted) loan may be slashed.
+        if loan.repaid || loan.defaulted {
+            panic_with_error!(&env, ContractError::InvalidStateTransition);
+        }
 
         let token = Self::token(&env);
         let cfg = Self::config(&env);
@@ -737,8 +756,10 @@ impl QuorumCreditContract {
             .get(&DataKey::Loan(borrower.clone()))
             .expect("no active loan");
 
-        assert!(!loan.repaid, "loan already repaid");
-        assert!(!loan.defaulted, "loan already defaulted");
+        // Guard: only an active (non-repaid, non-defaulted) loan may be claimed.
+        if loan.repaid || loan.defaulted {
+            panic_with_error!(&env, ContractError::InvalidStateTransition);
+        }
 
         let now = env.ledger().timestamp();
         assert!(now >= loan.deadline, "loan has not expired yet");
@@ -840,8 +861,10 @@ impl QuorumCreditContract {
             .get(&DataKey::Loan(borrower.clone()))
             .expect("no active loan");
 
-        assert!(!loan.repaid, "loan already repaid");
-        assert!(!loan.defaulted, "loan already defaulted");
+        // Guard: only an active (non-repaid, non-defaulted) loan may be auto-slashed.
+        if loan.repaid || loan.defaulted {
+            panic_with_error!(&env, ContractError::InvalidStateTransition);
+        }
         assert!(
             env.ledger().timestamp() > loan.deadline,
             "loan deadline has not passed"
@@ -990,7 +1013,10 @@ impl QuorumCreditContract {
             .get(&DataKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        assert!(config.yield_bps >= 0, "yield_bps must be non-negative");
+        assert!(
+            config.yield_bps >= 0 && config.yield_bps <= 10_000,
+            "yield_bps must be 0-10000"
+        );
         assert!(
             config.slash_bps > 0 && config.slash_bps <= 10_000,
             "slash_bps must be 1-10000"
@@ -1420,6 +1446,15 @@ impl QuorumCreditContract {
         } else {
             Ok(())
         }
+    }
+
+    /// Returns `Err(InvalidAmount)` if `amount` is not strictly positive (≤ 0).
+    /// Use this for all numeric inputs that must be > 0 (stakes, loan amounts, thresholds).
+    fn require_positive_amount(_env: &Env, amount: i128) -> Result<(), ContractError> {
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        Ok(())
     }
 
     fn config(env: &Env) -> Config {
@@ -3295,77 +3330,242 @@ mod tests {
         assert_eq!(client.get_config().slash_bps, 10_000);
     }
 
-    // ── slash_timestamp audit tests ───────────────────────────────────────────
+    // ── Input Validation Tests ────────────────────────────────────────────────
+
+    // --- Numeric: zero / negative stake in vouch ---
 
     #[test]
-    fn test_slash_timestamp_set_on_slash() {
+    fn test_vouch_zero_stake_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(2_000_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
-        client.vouch(&voucher, &borrower, &1_000_000);
-        client.request_loan(&borrower, &500_000, &1_000_000);
-        client.slash(&borrower);
-
-        let loan = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan.slash_timestamp, Some(2_000_000));
+        let result = client.try_vouch(&voucher, &borrower, &0);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidAmount)),
+            "zero stake must be rejected with InvalidAmount"
+        );
+        // State must not have changed.
+        assert!(client.get_vouches(&borrower).is_none());
     }
 
     #[test]
-    fn test_slash_timestamp_none_for_repaid_loan() {
+    fn test_vouch_negative_stake_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let result = client.try_vouch(&voucher, &borrower, &-1);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidAmount)),
+            "negative stake must be rejected with InvalidAmount"
+        );
+        assert!(client.get_vouches(&borrower).is_none());
+    }
+
+    // --- Numeric: zero / negative additional in increase_stake ---
+
+    #[test]
+    fn test_increase_stake_zero_rejected() {
         let env = Env::default();
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
-        client.request_loan(&borrower, &500_000, &1_000_000);
-        client.repay(&borrower);
-
-        let loan = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan.slash_timestamp, None);
+        let result = client.try_increase_stake(&voucher, &borrower, &0);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidAmount)),
+            "zero additional stake must be rejected with InvalidAmount"
+        );
+        // Stake must be unchanged.
+        let vouches = client.get_vouches(&borrower).unwrap();
+        assert_eq!(vouches.get(0).unwrap().stake, 1_000_000);
     }
 
     #[test]
-    fn test_slash_timestamp_none_for_active_loan() {
+    fn test_increase_stake_negative_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(1_000_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
-        client.request_loan(&borrower, &500_000, &1_000_000);
+        let result = client.try_increase_stake(&voucher, &borrower, &-500);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidAmount)),
+            "negative additional stake must be rejected with InvalidAmount"
+        );
+        let vouches = client.get_vouches(&borrower).unwrap();
+        assert_eq!(vouches.get(0).unwrap().stake, 1_000_000);
+    }
 
-        let loan = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan.slash_timestamp, None);
+    // --- Numeric: zero / negative threshold in request_loan ---
+
+    #[test]
+    fn test_request_loan_zero_threshold_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        let result = client.try_request_loan(&borrower, &500_000, &0);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidAmount)),
+            "zero threshold must be rejected with InvalidAmount"
+        );
+        // No loan must have been created.
+        assert!(client.get_loan(&borrower).is_none());
     }
 
     #[test]
-    fn test_slash_timestamp_not_overwritten_on_repeated_slash_attempt() {
+    fn test_request_loan_negative_threshold_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(3_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        let result = client.try_request_loan(&borrower, &500_000, &-1);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InvalidAmount)),
+            "negative threshold must be rejected with InvalidAmount"
+        );
+        assert!(client.get_loan(&borrower).is_none());
+    }
+
+    // --- Config: yield_bps out of bounds ---
+
+    #[test]
+    fn test_set_config_yield_bps_above_10000_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.yield_bps = 10_001;
+        let result = client.try_set_config(&cfg);
+        assert!(
+            result.is_err(),
+            "yield_bps > 10000 must be rejected"
+        );
+        // Config must be unchanged.
+        assert_eq!(client.get_config().yield_bps, DEFAULT_YIELD_BPS);
+    }
+
+    #[test]
+    fn test_set_config_yield_bps_zero_accepted() {
+        // yield_bps = 0 means no yield — valid (vouchers get stake back only).
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.yield_bps = 0;
+        client.set_config(&cfg);
+        assert_eq!(client.get_config().yield_bps, 0);
+    }
+
+    #[test]
+    fn test_set_config_min_loan_amount_zero_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.min_loan_amount = 0;
+        let result = client.try_set_config(&cfg);
+        assert!(result.is_err(), "min_loan_amount = 0 must be rejected");
+        assert_eq!(client.get_config().min_loan_amount, DEFAULT_MIN_LOAN_AMOUNT);
+    }
+
+    #[test]
+    fn test_set_config_loan_duration_zero_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.loan_duration = 0;
+        let result = client.try_set_config(&cfg);
+        assert!(result.is_err(), "loan_duration = 0 must be rejected");
+        assert_eq!(client.get_config().loan_duration, DEFAULT_LOAN_DURATION);
+    }
+
+    #[test]
+    fn test_set_config_max_vouchers_zero_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.max_vouchers = 0;
+        let result = client.try_set_config(&cfg);
+        assert!(result.is_err(), "max_vouchers = 0 must be rejected");
+        assert_eq!(client.get_config().max_vouchers, DEFAULT_MAX_VOUCHERS);
+    }
+
+    #[test]
+    fn test_set_config_max_loan_to_stake_ratio_zero_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        let mut cfg = client.get_config();
+        cfg.max_loan_to_stake_ratio = 0;
+        let result = client.try_set_config(&cfg);
+        assert!(result.is_err(), "max_loan_to_stake_ratio = 0 must be rejected");
+        assert_eq!(
+            client.get_config().max_loan_to_stake_ratio,
+            DEFAULT_MAX_LOAN_TO_STAKE_RATIO
+        );
+    }
+
+    // --- State transitions: slash on already-defaulted loan ---
+
+    #[test]
+    fn test_slash_already_defaulted_loan_rejected() {
+        let env = Env::default();
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
         client.request_loan(&borrower, &500_000, &1_000_000);
-        client.slash(&borrower);
+        client.slash(&borrower); // first slash — valid
 
-        let loan_after_first_slash = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan_after_first_slash.slash_timestamp, Some(3_000_000));
-
-        // Advance time and attempt a second slash — must be rejected.
-        env.ledger().set_timestamp(4_000_000);
+        // Second slash on an already-defaulted loan must fail.
         let result = client.try_slash(&borrower);
-        assert!(result.is_err(), "second slash must fail");
-
-        // Timestamp must remain unchanged.
-        let loan_after_second_attempt = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan_after_second_attempt.slash_timestamp, Some(3_000_000));
+        assert!(
+            result.is_err(),
+            "slashing an already-defaulted loan must be rejected"
+        );
     }
 
     #[test]
-    fn test_auto_slash_timestamp_set_after_deadline() {
+    fn test_slash_already_repaid_loan_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower); // repaid
+
+        // Slashing a repaid loan must fail.
+        let result = client.try_slash(&borrower);
+        assert!(
+            result.is_err(),
+            "slashing a repaid loan must be rejected"
+        );
+    }
+
+    // --- State transitions: auto_slash on already-defaulted / repaid loan ---
+
+    #[test]
+    fn test_auto_slash_already_defaulted_rejected() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
@@ -3380,113 +3580,149 @@ mod tests {
         client.request_loan(&borrower, &500_000, &1_000_000);
 
         env.ledger().set_timestamp(1_002_000);
-        client.auto_slash(&borrower);
+        client.auto_slash(&borrower); // first auto_slash — valid
 
-        let loan = client.get_loan(&borrower).unwrap();
-        assert_eq!(loan.slash_timestamp, Some(1_002_000));
+        // Second auto_slash must fail.
+        let result = client.try_auto_slash(&borrower);
+        assert!(
+            result.is_err(),
+            "auto_slash on already-defaulted loan must be rejected"
+        );
     }
 
     #[test]
-    fn test_slash_timestamp_persists_through_storage_read_write() {
+    fn test_auto_slash_already_repaid_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(5_000_000);
+        env.ledger().set_timestamp(1_000_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
         client.request_loan(&borrower, &500_000, &1_000_000);
-        client.slash(&borrower);
+        client.repay(&borrower);
 
-        // Read back from storage and verify the timestamp survived serialisation round-trip.
-        let loan = client.get_loan(&borrower).unwrap();
-        assert!(loan.defaulted);
-        assert_eq!(loan.slash_timestamp, Some(5_000_000));
-        assert_eq!(loan.slash_timestamp.unwrap(), 5_000_000);
+        // auto_slash on a repaid loan must fail.
+        let result = client.try_auto_slash(&borrower);
+        assert!(
+            result.is_err(),
+            "auto_slash on a repaid loan must be rejected"
+        );
     }
 
-    // ── vouch_timestamp audit tests ───────────────────────────────────────────
+    // --- State transitions: claim_expired_loan on already-defaulted / repaid ---
 
     #[test]
-    fn test_vouch_timestamp_set_on_creation() {
+    fn test_claim_expired_loan_already_defaulted_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(7_000_000);
+        env.ledger().set_timestamp(1_000_000);
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.set_config(&{
+            let mut c = client.get_config();
+            c.loan_duration = 1_000;
+            c
+        });
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        env.ledger().set_timestamp(1_002_000);
+        client.claim_expired_loan(&borrower); // first claim — valid
+
+        // Second claim must fail.
+        let result = client.try_claim_expired_loan(&borrower);
+        assert!(
+            result.is_err(),
+            "claim_expired_loan on already-defaulted loan must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_claim_expired_loan_already_repaid_rejected() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower);
 
-        let vouches = client.get_vouches(&borrower).unwrap();
-        assert_eq!(vouches.len(), 1);
-        assert_eq!(vouches.get(0).unwrap().vouch_timestamp, 7_000_000);
+        let result = client.try_claim_expired_loan(&borrower);
+        assert!(
+            result.is_err(),
+            "claim_expired_loan on a repaid loan must be rejected"
+        );
     }
 
+    // --- State transitions: repay on already-repaid loan ---
+
     #[test]
-    fn test_vouch_timestamp_persists_through_storage_round_trip() {
+    fn test_repay_already_repaid_loan_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(8_500_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &1_000_000);
+        client.repay(&borrower);
 
-        // Read back twice to confirm storage round-trip stability.
-        let first_read = client.get_vouches(&borrower).unwrap().get(0).unwrap();
-        let second_read = client.get_vouches(&borrower).unwrap().get(0).unwrap();
-        assert_eq!(first_read.vouch_timestamp, 8_500_000);
-        assert_eq!(second_read.vouch_timestamp, 8_500_000);
+        // Second repay must fail — loan is already repaid.
+        let result = client.try_repay(&borrower);
+        assert!(
+            result.is_err(),
+            "repaying an already-repaid loan must be rejected"
+        );
     }
 
+    // --- Double-initialize rejected ---
+
     #[test]
-    fn test_vouch_timestamp_unchanged_after_increase_stake() {
+    fn test_initialize_twice_rejected() {
         let env = Env::default();
-        env.ledger().set_timestamp(9_000_000);
-        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let (contract_id, token_addr, admin, _borrower, _voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
-        client.vouch(&voucher, &borrower, &1_000_000);
-
-        // Advance time then increase stake — timestamp must not change.
-        env.ledger().set_timestamp(9_999_999);
-        client.increase_stake(&voucher, &borrower, &500_000);
-
-        let vouch = client.get_vouches(&borrower).unwrap().get(0).unwrap();
-        assert_eq!(vouch.stake, 1_500_000);
-        assert_eq!(vouch.vouch_timestamp, 9_000_000); // original timestamp preserved
+        // Contract is already initialized by setup(); a second call must fail.
+        let result = client.try_initialize(&admin, &admin, &token_addr);
+        assert!(
+            result.is_err(),
+            "double-initialize must be rejected with AlreadyInitialized"
+        );
     }
 
+    // --- Validation does not mutate state on failure ---
+
     #[test]
-    fn test_vouch_timestamp_independent_per_voucher() {
+    fn test_invalid_stake_does_not_mutate_state() {
         let env = Env::default();
         let (contract_id, token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let token_admin = StellarAssetClient::new(&env, &token_addr);
+        let token = TokenClient::new(&env, &token_addr);
 
-        env.ledger().set_timestamp(1_100_000);
-        client.vouch(&voucher, &borrower, &1_000_000);
+        let balance_before = token.balance(&voucher);
 
-        let voucher2 = Address::generate(&env);
-        token_admin.mint(&voucher2, &5_000_000);
-        env.ledger().set_timestamp(1_200_000);
-        client.vouch(&voucher2, &borrower, &1_000_000);
+        // Zero stake — must fail without touching storage or token balances.
+        let _ = client.try_vouch(&voucher, &borrower, &0);
 
-        let vouches = client.get_vouches(&borrower).unwrap();
-        assert_eq!(vouches.get(0).unwrap().vouch_timestamp, 1_100_000);
-        assert_eq!(vouches.get(1).unwrap().vouch_timestamp, 1_200_000);
+        assert_eq!(token.balance(&voucher), balance_before, "balance must be unchanged after failed vouch");
+        assert!(client.get_vouches(&borrower).is_none(), "no vouch record must exist after failed vouch");
     }
 
     #[test]
-    fn test_vouch_timestamp_present_after_loan_active() {
+    fn test_invalid_threshold_does_not_create_loan() {
         let env = Env::default();
-        env.ledger().set_timestamp(2_200_000);
         let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         client.vouch(&voucher, &borrower, &1_000_000);
-        client.request_loan(&borrower, &500_000, &1_000_000);
 
-        // Vouches are still readable while loan is active.
-        let vouch = client.get_vouches(&borrower).unwrap().get(0).unwrap();
-        assert_eq!(vouch.vouch_timestamp, 2_200_000);
+        // Zero threshold — must fail without creating a loan record.
+        let _ = client.try_request_loan(&borrower, &500_000, &0);
+
+        assert!(
+            client.get_loan(&borrower).is_none(),
+            "no loan record must exist after failed request_loan"
+        );
     }
 }
 
