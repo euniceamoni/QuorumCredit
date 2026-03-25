@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, BytesN, Env,
     Vec,
 };
 
@@ -242,7 +242,7 @@ impl QuorumCreditContract {
                 .persistent()
                 .get(&DataKey::LastVouchTimestamp(voucher.clone()))
                 .unwrap_or(0);
-            if now < last + cfg.vouch_cooldown_secs {
+            if last > 0 && now < last + cfg.vouch_cooldown_secs {
                 return Err(ContractError::VouchCooldownActive);
             }
         }
@@ -1540,8 +1540,8 @@ mod tests {
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         let token = TokenClient::new(&env, &token_addr);
 
-        client.vouch(&voucher, &borrower, &50);
-        client.request_loan(&borrower, &Vec::new(&env), &100_000, &50);
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &Vec::new(&env), &100_000, &1_000_000);
         client.repay(&borrower, &100_000);
 
         let initial_balance: i128 = 10_000_000;
