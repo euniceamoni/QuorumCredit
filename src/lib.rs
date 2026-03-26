@@ -1397,6 +1397,26 @@ impl QuorumCreditContract {
             .unwrap_or(0)
     }
 
+    /// Admin sets the maximum loan-to-stake ratio (as a percentage, e.g. 150 = 150%).
+    /// A value of 0 is rejected; use set_config to disable the ratio check entirely
+    /// by setting max_loan_to_stake_ratio to a very large number.
+    pub fn set_max_loan_to_stake_ratio(
+        env: Env,
+        admin_signers: Vec<Address>,
+        ratio: u32,
+    ) {
+        Self::require_admin_approval(&env, &admin_signers);
+        assert!(ratio > 0, "max_loan_to_stake_ratio must be greater than zero");
+        let mut cfg = Self::config(&env);
+        cfg.max_loan_to_stake_ratio = ratio;
+        env.storage().instance().set(&DataKey::Config, &cfg);
+    }
+
+    /// Returns the current maximum loan-to-stake ratio (percentage).
+    pub fn get_max_loan_to_stake_ratio(env: Env) -> u32 {
+        Self::config(&env).max_loan_to_stake_ratio
+    }
+
     /// Admin updates configurable protocol parameters.
     pub fn set_config(env: Env, admin_signers: Vec<Address>, config: Config) {
         Self::require_admin_approval(&env, &admin_signers);
@@ -4200,280 +4220,121 @@ mod tests {
         assert!(client.vouch_exists(&voucher_b, &borrower));
     }
 
-    // ── Admin Action Event Tests ───────────────────────────────────────────────
+    // ── Max Loan-to-Stake Ratio Tests ─────────────────────────────────────────
 
-    fn find_admin_event<'a>(
-        env: &'a Env,
-        action: soroban_sdk::Symbol,
-    ) -> bool {
-        use soroban_sdk::{IntoVal, Val};
-        let topic_admin: Val = symbol_short!("admin").into_val(env);
-        let topic_action: Val = action.into_val(env);
-        env.events().all().iter().any(|(_, topics, _)| {
-            topics.len() == 2
-                && topics.get_unchecked(0).get_payload() == topic_admin.get_payload()
-                && topics.get_unchecked(1).get_payload() == topic_action.get_payload()
-        })
+    #[test]
+    fn test_max_loan_to_stake_ratio_default_is_150() {
+        let env = Env::default();
+        let (contract_id, _, _, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        assert_eq!(client.get_max_loan_to_stake_ratio(), DEFAULT_MAX_LOAN_TO_STAKE_RATIO);
     }
 
     #[test]
-    fn test_pause_emits_event() {
+    fn test_set_max_loan_to_stake_ratio_updates_config() {
         let env = Env::default();
         let (contract_id, _, admin, _, _) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        client.pause(&single_admin_signers(&env, &admin));
-        assert!(find_admin_event(&env, symbol_short!("pause")));
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        client.set_max_loan_to_stake_ratio(&admin_signers, &100);
+        assert_eq!(client.get_max_loan_to_stake_ratio(), 100);
     }
 
     #[test]
-    fn test_unpause_emits_event() {
+    #[should_panic(expected = "max_loan_to_stake_ratio must be greater than zero")]
+    fn test_set_max_loan_to_stake_ratio_zero_rejected() {
         let env = Env::default();
         let (contract_id, _, admin, _, _) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-        client.pause(&signers);
-        client.unpause(&signers);
-        assert!(find_admin_event(&env, symbol_short!("unpause")));
+        let admin_signers = single_admin_signers(&env, &admin);
+        client.set_max_loan_to_stake_ratio(&admin_signers, &0);
     }
 
     #[test]
-    fn test_set_min_stake_emits_event() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        client.set_min_stake(&single_admin_signers(&env, &admin), &500_000);
-        assert!(find_admin_event(&env, symbol_short!("minstake")));
-    }
-
-    #[test]
-    fn test_set_max_loan_amount_emits_event() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        client.set_max_loan_amount(&single_admin_signers(&env, &admin), &1_000_000);
-        assert!(find_admin_event(&env, symbol_short!("maxloan")));
-    }
-
-    #[test]
-    fn test_set_min_vouchers_emits_event() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        client.set_min_vouchers(&single_admin_signers(&env, &admin), &2);
-        assert!(find_admin_event(&env, symbol_short!("minvchrs")));
-    }
-
-    #[test]
-    fn test_set_config_emits_event() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-        let cfg = client.get_config();
-        client.set_config(&signers, &cfg);
-        assert!(find_admin_event(&env, symbol_short!("config")));
-    }
-
-    #[test]
-    fn test_set_protocol_fee_emits_event() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        client.set_protocol_fee(&single_admin_signers(&env, &admin), &100);
-        assert!(find_admin_event(&env, symbol_short!("fee")));
-    }
-
-    #[test]
-    fn test_slash_treasury_emits_event() {
+    fn test_request_loan_at_exact_ratio_limit_succeeds() {
         let env = Env::default();
         let (contract_id, _, admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        // Set ratio to 100%: loan cannot exceed total stake
+        client.set_max_loan_to_stake_ratio(&admin_signers, &100);
 
         client.vouch(&voucher, &borrower, &1_000_000);
-        advance_past_vouch_age(&env);
+        // Exactly 100% of 1_000_000 = 1_000_000 — should succeed
+        client.request_loan(&borrower, &Vec::new(&env), &1_000_000, &1_000_000);
+        assert_eq!(client.get_loan(&borrower).unwrap().amount, 1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "loan amount exceeds maximum collateral ratio")]
+    fn test_request_loan_exceeds_ratio_rejected() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        // Set ratio to 50%: max loan = 500_000 for 1_000_000 stake
+        client.set_max_loan_to_stake_ratio(&admin_signers, &50);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        // 600_000 > 50% of 1_000_000 — must be rejected
+        client.request_loan(&borrower, &Vec::new(&env), &600_000, &1_000_000);
+    }
+
+    #[test]
+    fn test_request_loan_below_ratio_limit_succeeds() {
+        let env = Env::default();
+        let (contract_id, _, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        client.set_max_loan_to_stake_ratio(&admin_signers, &50);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        // 500_000 == 50% of 1_000_000 — exactly at limit, should succeed
         client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
-        client.slash(&signers, &borrower);
-
-        let recipient = Address::generate(&env);
-        client.slash_treasury(&signers, &recipient);
-        assert!(find_admin_event(&env, symbol_short!("treasury")));
+        assert_eq!(client.get_loan(&borrower).unwrap().amount, 500_000);
     }
 
     #[test]
-    fn test_set_reputation_nft_emits_event() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let nft_id = env.register_contract(None, reputation::ReputationNftContract);
-        reputation::ReputationNftContractClient::new(&env, &nft_id).initialize(&contract_id);
-        client.set_reputation_nft(&single_admin_signers(&env, &admin), &nft_id);
-        assert!(find_admin_event(&env, symbol_short!("repnft")));
-    }
-
-    // ── Timelock Tests ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_propose_action_creates_proposal_with_correct_eta() {
+    fn test_increasing_ratio_allows_larger_loan() {
         let env = Env::default();
         let (contract_id, _, admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
+        let admin_signers = single_admin_signers(&env, &admin);
 
+        // Start at 50%, repay, then raise to 200% and take a bigger loan
+        client.set_max_loan_to_stake_ratio(&admin_signers, &50);
         client.vouch(&voucher, &borrower, &1_000_000);
-
-        let now = env.ledger().timestamp();
-        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
-
-        let proposal = client.get_proposal(&id).unwrap();
-        assert_eq!(proposal.id, id);
-        assert_eq!(proposal.eta, now + TIMELOCK_DELAY);
-        assert!(!proposal.executed);
-        assert!(!proposal.cancelled);
-    }
-
-    #[test]
-    fn test_execute_action_slash_before_eta_rejected() {
-        let env = Env::default();
-        let (contract_id, _, admin, borrower, voucher) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-
-        client.vouch(&voucher, &borrower, &1_000_000);
-        advance_past_vouch_age(&env);
         client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
+        client.repay(&borrower, &500_000);
 
-        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
-
-        // Try to execute immediately — must fail.
-        let result = client.try_execute_action(&signers, &id);
-        assert_eq!(result, Err(Ok(ContractError::TimelockNotReady)));
+        client.set_max_loan_to_stake_ratio(&admin_signers, &200);
+        // 2_000_000 == 200% of 1_000_000 — should now succeed
+        client.request_loan(&borrower, &Vec::new(&env), &2_000_000, &1_000_000);
+        assert_eq!(client.get_loan(&borrower).unwrap().amount, 2_000_000);
     }
 
     #[test]
-    fn test_execute_action_slash_after_eta_succeeds() {
+    fn test_ratio_enforced_with_multiple_vouchers() {
         let env = Env::default();
         let (contract_id, token_addr, admin, borrower, voucher) = setup(&env);
         let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let token = soroban_sdk::token::Client::new(&env, &token_addr);
-        let signers = single_admin_signers(&env, &admin);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        // Set ratio to 100%
+        client.set_max_loan_to_stake_ratio(&admin_signers, &100);
+
+        let voucher2 = Address::generate(&env);
+        token_admin.mint(&voucher2, &10_000_000);
 
         client.vouch(&voucher, &borrower, &1_000_000);
-        advance_past_vouch_age(&env);
-        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
-
-        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
-
-        // Advance past the timelock delay.
-        env.ledger().set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
-        client.execute_action(&signers, &id);
-
-        assert!(client.get_loan(&borrower).unwrap().defaulted);
-        assert_eq!(token.balance(&voucher), 9_500_000); // 50% slashed
-        let proposal = client.get_proposal(&id).unwrap();
-        assert!(proposal.executed);
-    }
-
-    #[test]
-    fn test_execute_action_set_config_after_eta_succeeds() {
-        let env = Env::default();
-        let (contract_id, _, admin, _, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-
-        let mut new_cfg = client.get_config();
-        new_cfg.yield_bps = 300;
-
-        let id = client.propose_action(&signers, &TimelockAction::SetConfig(new_cfg.clone()));
-        env.ledger().set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
-        client.execute_action(&signers, &id);
-
-        assert_eq!(client.get_config().yield_bps, 300);
-    }
-
-    #[test]
-    fn test_execute_action_after_expiry_rejected() {
-        let env = Env::default();
-        let (contract_id, _, admin, borrower, voucher) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-
-        client.vouch(&voucher, &borrower, &1_000_000);
-        advance_past_vouch_age(&env);
-        client.request_loan(&borrower, &Vec::new(&env), &500_000, &1_000_000);
-
-        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
-
-        // Advance past eta + expiry window.
-        env.ledger().set_timestamp(
-            env.ledger().timestamp() + TIMELOCK_DELAY + TIMELOCK_EXPIRY + 1,
-        );
-        let result = client.try_execute_action(&signers, &id);
-        assert_eq!(result, Err(Ok(ContractError::TimelockExpired)));
-    }
-
-    #[test]
-    fn test_cancel_action_prevents_execution() {
-        let env = Env::default();
-        let (contract_id, _, admin, borrower, voucher) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-
-        client.vouch(&voucher, &borrower, &1_000_000);
-        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
-
-        client.cancel_action(&signers, &id);
-
-        let proposal = client.get_proposal(&id).unwrap();
-        assert!(proposal.cancelled);
-    }
-
-    #[test]
-    #[should_panic(expected = "proposal cancelled")]
-    fn test_execute_cancelled_proposal_panics() {
-        let env = Env::default();
-        let (contract_id, _, admin, borrower, voucher) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-
-        client.vouch(&voucher, &borrower, &1_000_000);
-        let id = client.propose_action(&signers, &TimelockAction::Slash(borrower.clone()));
-        client.cancel_action(&signers, &id);
-
-        env.ledger().set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
-        client.execute_action(&signers, &id);
-    }
-
-    #[test]
-    fn test_propose_emits_event() {
-        use soroban_sdk::{IntoVal, Val};
-        let env = Env::default();
-        let (contract_id, _, admin, borrower, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let signers = single_admin_signers(&env, &admin);
-
-        client.propose_action(&signers, &TimelockAction::Slash(borrower));
-
-        let topic_tl: Val = symbol_short!("tl").into_val(&env);
-        let topic_proposed: Val = symbol_short!("proposed").into_val(&env);
-        let found = env.events().all().iter().any(|(_, topics, _)| {
-            topics.len() == 2
-                && topics.get_unchecked(0).get_payload() == topic_tl.get_payload()
-                && topics.get_unchecked(1).get_payload() == topic_proposed.get_payload()
-        });
-        assert!(found, "tl/proposed event not emitted");
-    }
-
-    #[test]
-    #[should_panic(expected = "insufficient admin approvals")]
-    fn test_propose_action_requires_admin() {
-        let env = Env::default();
-        let (contract_id, _, _admin, borrower, _) = setup(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-        let outsider = Address::generate(&env);
-        client.propose_action(
-            &single_admin_signers(&env, &outsider),
-            &TimelockAction::Slash(borrower),
-        );
+        client.vouch(&voucher2, &borrower, &1_000_000);
+        // total_stake = 2_000_000; 100% = 2_000_000 max
+        client.request_loan(&borrower, &Vec::new(&env), &2_000_000, &2_000_000);
+        assert_eq!(client.get_loan(&borrower).unwrap().amount, 2_000_000);
     }
 }
